@@ -45,6 +45,160 @@ const HostsSchema = z.object({
   })).default([]),
 });
 
+// 解析环境变量中的主机配置
+function parseHostsFromEnv(): StoredHost[] {
+  const hosts: StoredHost[] = [];
+  
+  // 支持两种格式的环境变量：
+  // 1. SSH_MCP_HOSTS: JSON数组字符串
+  // 2. SSH_MCP_HOST_<N>: 单个主机配置
+  
+  // 格式1: JSON数组
+  const hostsJson = process.env.SSH_MCP_HOSTS;
+  if (hostsJson) {
+    try {
+      const parsed = JSON.parse(hostsJson);
+      if (Array.isArray(parsed)) {
+        parsed.forEach((item, index) => {
+          if (item.id && item.host && item.username) {
+            hosts.push({
+              id: item.id,
+              host: item.host,
+              port: item.port || 22,
+              username: item.username,
+              password: item.password,
+              keyPath: item.keyPath,
+            });
+          }
+        });
+      }
+    } catch (error) {
+      console.error('Failed to parse SSH_MCP_HOSTS:', error);
+    }
+  }
+  
+  // 格式2: 单个环境变量 (SSH_MCP_HOST_1, SSH_MCP_HOST_2, ...)
+  const hostPrefix = 'SSH_MCP_HOST_';
+  Object.keys(process.env).forEach(key => {
+    if (key.startsWith(hostPrefix)) {
+      const hostStr = process.env[key];
+      if (hostStr) {
+        try {
+          const hostObj = JSON.parse(hostStr);
+          if (hostObj.id && hostObj.host && hostObj.username) {
+            hosts.push({
+              id: hostObj.id,
+              host: hostObj.host,
+              port: hostObj.port || 22,
+              username: hostObj.username,
+              password: hostObj.password,
+              keyPath: hostObj.keyPath,
+            });
+          }
+        } catch (error) {
+          console.error(`Failed to parse ${key}:`, error);
+        }
+      }
+    }
+  });
+  
+  // 格式3: 简单的键值对格式 (SSH_MCP_HOST=user@host:port)
+  const simpleHosts = process.env.SSH_MCP_HOSTS_SIMPLE;
+  if (simpleHosts) {
+    const lines = simpleHosts.split(';').filter(line => line.trim());
+    lines.forEach(line => {
+      const parts = line.trim().split('|');
+      if (parts.length >= 2) {
+        const [id, connection] = parts;
+        const [userHost, portStr] = connection.split(':');
+        const [username, host] = userHost.split('@');
+        
+        if (username && host) {
+          hosts.push({
+            id: id.trim(),
+            host: host.trim(),
+            port: portStr ? parseInt(portStr.trim()) : 22,
+            username: username.trim(),
+          });
+        }
+      }
+    });
+  }
+  
+  return hosts;
+}
+
+// 将环境变量中的主机保存到配置文件
+async function saveEnvHostsToConfig(): Promise<void> {
+  const envHosts = parseHostsFromEnv();
+  if (envHosts.length === 0) {
+    return;
+  }
+  
+  try {
+    const existingHosts = await readHosts();
+    const existingIds = new Set(existingHosts.map(h => h.id));
+    
+    // 只添加不存在的主机
+    const hostsToAdd = envHosts.filter(host => !existingIds.has(host.id));
+    
+    if (hostsToAdd.length > 0) {
+      const newHosts = [...existingHosts, ...hostsToAdd];
+      await writeHosts(newHosts);
+      console.error(`Added ${hostsToAdd.length} host(s) from environment variables`);
+    }
+  } catch (error) {
+    console.error('Failed to save environment hosts to config:', error);
+  }
+}
+
+// 从环境变量创建初始连接
+async function createConnectionsFromEnv(): Promise<void> {
+  const envHosts = parseHostsFromEnv();
+  if (envHosts.length === 0) {
+    return;
+  }
+  
+  console.error(`Creating initial connections for ${envHosts.length} host(s) from environment...`);
+  
+  for (const host of envHosts) {
+    try {
+      const config: ConnectConfig = {
+        host: host.host,
+        port: host.port,
+        username: host.username,
+      };
+      
+      if (host.password) {
+        config.password = host.password;
+      } else if (host.keyPath) {
+        const expanded = expandPath(host.keyPath);
+        if (expanded) {
+          try {
+            const keyContent = await readFile(expanded, 'utf8');
+            config.privateKey = keyContent;
+          } catch (error) {
+            console.error(`Failed to read key file for ${host.id}:`, error);
+            continue;
+          }
+        }
+      }
+      
+      // 使用特殊的session ID格式，便于识别自动创建的连接
+      const sessionId = `auto_${host.id}`;
+      
+      // 创建连接但不等待完成，避免某个连接失败阻塞其他连接
+      getOrCreateSession(sessionId, config, true).catch(error => {
+        console.error(`Failed to create session for ${host.id}:`, error.message);
+      });
+      
+      console.error(`Created auto-connection for ${host.id}`);
+    } catch (error) {
+      console.error(`Error setting up connection for ${host.id}:`, error);
+    }
+  }
+}
+
 async function ensureHostsFile(): Promise<void> {
   await mkdir(HOSTS_DIR, { recursive: true });
   try {
@@ -141,41 +295,41 @@ const DEFAULT_SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 const server = new McpServer({
   name: 'SSH MCP Server',
-  version: '1.0.9',
+  version: '1.1.0', // 版本号增加
   capabilities: {
     resources: {},
     tools: {},
   },
 });
 
-server.tool(
-  "add-host",
-  "Persist a new SSH host configuration.",
-  {
-    host_id: z.string().describe("Unique identifier for the host. we recommend user@hostname"),
-    host: z.string().describe("Hostname or IP address"),
-    port: z.number().int().positive().default(22).describe("SSH port (default 22)"),
-    username: z.string().describe("SSH username"),
-    password: z.string().optional().describe("Password for authentication"),
-    keyPath: z.string().optional().describe("Path to private key (defaults to SSH agent if omitted)"),
-  },
-  async ({ host_id, host, port, username, password, keyPath }) => {
-    const hosts = await readHosts();
-    if (hosts.some((h) => h.id === host_id)) {
-      throw new McpError(ErrorCode.InvalidParams, `Host '${host_id}' already exists`);
-    }
-    hosts.push({
-      id: host_id,
-      host,
-      port,
-      username,
-      password,
-      keyPath,
-    });
-    await writeHosts(hosts);
-    return { content: [{ type: 'text', text: `Host '${host_id}' added` }] };
-  }
-);
+//server.tool(
+//  "add-host",
+//  "Persist a new SSH host configuration.",
+//  {
+//    host_id: z.string().describe("Unique identifier for the host. we recommend user@hostname"),
+//    host: z.string().describe("Hostname or IP address"),
+//    port: z.number().int().positive().default(22).describe("SSH port (default 22)"),
+//    username: z.string().describe("SSH username"),
+//    password: z.string().optional().describe("Password for authentication"),
+//    keyPath: z.string().optional().describe("Path to private key (defaults to SSH agent if omitted)"),
+//  },
+//  async ({ host_id, host, port, username, password, keyPath }) => {
+//    const hosts = await readHosts();
+//    if (hosts.some((h) => h.id === host_id)) {
+//      throw new McpError(ErrorCode.InvalidParams, `Host '${host_id}' already exists`);
+//    }
+//    hosts.push({
+//      id: host_id,
+//      host,
+//      port,
+//      username,
+//      password,
+//      keyPath,
+//    });
+//    await writeHosts(hosts);
+//    return { content: [{ type: 'text', text: `Host '${host_id}' added` }] };
+//  }
+//);
 
 server.tool(
   "list-hosts",
@@ -310,8 +464,9 @@ server.tool(
       const uptimeMs = Date.now() - info.createdAt;
       const minutes = Math.floor(uptimeMs / 60000);
       const seconds = Math.floor((uptimeMs % 60000) / 1000);
+      const autoConn = id.startsWith('auto_') ? '[auto]' : '';
       lines.push(
-        `session=${id} host=${info.host}:${info.port} user=${info.username} uptime=${minutes}m${seconds}s lastCommand=${info.lastCommand ?? 'n/a'}`
+        `session=${id}${autoConn} host=${info.host}:${info.port} user=${info.username} uptime=${minutes}m${seconds}s lastCommand=${info.lastCommand ?? 'n/a'}`
       );
     }
 
@@ -568,6 +723,12 @@ class PersistentSession {
 }
 
 async function main() {
+  // 保存环境变量中的主机到配置文件
+  await saveEnvHostsToConfig();
+  
+  // 从环境变量创建初始连接
+  await createConnectionsFromEnv();
+  
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("SSH MCP Server running on stdio");

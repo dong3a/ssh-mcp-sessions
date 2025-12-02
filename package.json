@@ -20,6 +20,7 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.5",
+    "ssh-mcp-sessions": "^1.0.17",
     "ssh2": "^1.17.0",
     "zod": "3.23.8"
   },
@@ -34,13 +35,13 @@
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   },
-  "homepage": "https://github.com/fryjustinc/ssh-mcp-sessions#readme",
+  "homepage": "https://github.com/dong3a/ssh-mcp-sessions#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/fryjustinc/ssh-mcp-sessions.git"
+    "url": "https://github.com/dong3a/ssh-mcp-sessions.git"
   },
   "bugs": {
-    "url": "https://github.com/fryjustinc/ssh-mcp-sessions/issues"
+    "url": "https://github.com/dong3a/ssh-mcp-sessions/issues"
   },
   "keywords": [
     "ssh",
